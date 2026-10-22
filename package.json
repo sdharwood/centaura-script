@@ -1,0 +1,11 @@
+{
+  "name": "centaura-camera-assist",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node tests/run.cjs"
+  },
+  "devDependencies": {
+    "fengari": "^0.1.4"
+  }
+}
