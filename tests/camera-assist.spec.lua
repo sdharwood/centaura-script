@@ -31,6 +31,7 @@ Enum = {
     UserInputType={MouseButton1="MB1",MouseButton2="MB2",MouseMovement="Move",Touch="Touch"},
     KeyCode={RightShift="RightShift"}, CameraType={Scriptable="Scriptable",Custom="Custom"},
     RenderPriority={Camera={Value=200}},
+    HighlightDepthMode={AlwaysOnTop="AlwaysOnTop"},
 }
 RaycastParams = {new=function() return {} end}
 local frame = {}
@@ -114,6 +115,7 @@ Instance = {new=function(class)
     return object
 end}
 local world, players, input, run, menu, me, enemy, team, wall, warnings, rayRule
+local clicks, queued, deferTasks
 local function named(class,name,parent)
     local object = Instance.new(class); object.Name=name; object.Parent=parent; return object
 end
@@ -140,14 +142,21 @@ local function camera()
     return cam
 end
 local function setup()
-    signals={}; warnings={}; rayRule=nil
+    signals={}; warnings={}; rayRule=nil; clicks=0; queued={}; deferTasks=false
     shared={}; getgenv=nil; getsenv=nil; getgc=nil; getconnections=nil; hookfunction=nil
+    mouse1click=nil
+    task={spawn=function(callback)
+        if deferTasks then table.insert(queued,callback) else callback() end
+    end}
     world=named("Workspace","Workspace",nil); workspace=world
     players=named("Players","Players",nil); input={MouseEnabled=true,held=false,mouse=Vector2.new(1800,900)}
     for _, name in ipairs({"InputBegan","InputEnded","InputChanged","WindowFocusReleased","WindowFocused"}) do input[name]=signal() end
     function input:GetFocusedTextBox() return self.textbox end
     function input:GetMouseLocation() return self.mouse end
-    function input:IsMouseButtonPressed(button) expect(button==Enum.UserInputType.MouseButton2); return self.held end
+    function input:IsMouseButtonPressed(button)
+        if button==Enum.UserInputType.MouseButton1 then return self.manualLeft==true end
+        expect(button==Enum.UserInputType.MouseButton2); return self.held
+    end
     run={bindings={}}; menu={MenuIsOpen=false}
     function run:BindToRenderStep(name,priority,callback) self.bindings[name]={callback=callback,priority=priority} end
     function run:UnbindFromRenderStep(name) self.bindings[name]=nil end
@@ -332,5 +341,156 @@ test("smoothing parameters are consistent at 30, 60 and 144 FPS",function()
         if previousRemaining then expect(math.abs(remaining-previousRemaining)<0.000000001) end
         previousRemaining=remaining
     end
+end)
+local function allowAutofire()
+    mouse1click=function() clicks=clicks+1 end
+    enemy.Character:FindFirstChild("Head").Position=Vector3.new(2,0,100)
+    enemy.Character:FindFirstChild("HumanoidRootPart").Position=Vector3.new(2,-2,100)
+end
+local function flushTasks()
+    local jobs=queued; queued={}
+    for _, callback in ipairs(jobs) do callback() end
+end
+test("autofire defaults off; unavailable input does not break camera or ESP",function()
+    local api=start(); expect(not api.Config.AutoFire and not api.Config.ESP)
+    ui("AutoFireToggle").Activated:Fire(); expect(not api.Config.AutoFire)
+    expect(api.Status.fireError:find("mouse1click",1,true)~=nil)
+    ui("ESPToggle").Activated:Fire(); input.held=true; step()
+    expect(api.Status.target=="Enemy" and api.Status.espCount==1)
+end)
+test("autofire requires alignment and rate-limits attempts",function()
+    mouse1click=function() clicks=clicks+1 end
+    local api=start(); ui("AutoFireToggle").Activated:Fire(); input.held=true
+    step(); expect(clicks==0 and api.Status.fireState=="Aligning")
+    enemy.Character:FindFirstChild("Head").Position=Vector3.new(2,0,100)
+    step(); expect(clicks==1 and api.Status.fireAttempts==1)
+    step(); expect(clicks==1 and api.Status.fireState=="Cooldown")
+    step(0.3); expect(clicks==2, "A slow frame must not create a click burst")
+    input.held=false; step(1); expect(clicks==2)
+end)
+test("autofire respects walls, teammates, protection, manual fire and input gating",function()
+    allowAutofire(); local api=start(); ui("AutoFireToggle").Activated:Fire(); input.held=true
+    input.manualLeft=true; step(1); expect(clicks==0 and api.Status.fireState=="Manual fire")
+    input.manualLeft=false; rayRule=function() return {Instance=wall} end
+    step(1); expect(clicks==0)
+    rayRule=nil; enemy.Team=team; step(1); expect(clicks==0)
+    enemy.Team={}; local force=named("ForceField","ForceField",enemy.Character)
+    step(1); expect(clicks==0); force:Destroy()
+    input.WindowFocusReleased:Fire(); step(1); expect(clicks==0)
+    input.WindowFocused:Fire(); input.textbox={}; step(1); expect(clicks==0)
+    input.textbox=nil; menu.MenuIsOpen=true; step(1); expect(clicks==0)
+    menu.MenuIsOpen=false; input.mouse=Vector2.new(50,100); step(1); expect(clicks==0)
+    input.mouse=Vector2.new(1800,900); step(1); expect(clicks==1)
+    ui("AssistToggle").Activated:Fire(); step(1); expect(clicks==1)
+end)
+test("autofire rejects queued clicks after unload, RMB release or newly blocked target",function()
+    for _, scenario in ipairs({"unload","release","wall","death","camera","focus","disable","team","move","unequip"}) do
+        setup(); allowAutofire(); local api=start(); ui("AutoFireToggle").Activated:Fire()
+        input.held=true; deferTasks=true; step(1)
+        expect(#queued==1)
+        if scenario=="unload" then api.Destroy()
+        elseif scenario=="release" then input.held=false
+        elseif scenario=="wall" then rayRule=function() return {Instance=wall} end
+        elseif scenario=="death" then me.Character:FindFirstChild("Humanoid").Health=0
+        elseif scenario=="camera" then world.CurrentCamera=camera()
+        elseif scenario=="focus" then input.WindowFocusReleased:Fire()
+        elseif scenario=="disable" then ui("AutoFireToggle").Activated:Fire()
+        elseif scenario=="team" then enemy.Team=team
+        elseif scenario=="move" then enemy.Character:FindFirstChild("Head").Position=Vector3.new(90,0,100)
+        elseif scenario=="unequip" then me.Character:FindFirstChildOfClass("Tool").Parent=nil end
+        flushTasks(); expect(clicks==0, "Queued click must be rejected: "..scenario)
+    end
+end)
+test("only one pending click is scheduled even across multiple frames",function()
+    allowAutofire(); local api=start(); ui("AutoFireToggle").Activated:Fire()
+    input.held=true; deferTasks=true
+    step(1); step(1); step(1); expect(#queued==1)
+    flushTasks(); expect(clicks==1)
+    step(1); expect(#queued==1)
+end)
+test("rerun with saved autofire waits for a fresh game input or focus event",function()
+    allowAutofire(); local api=start(); ui("AutoFireToggle").Activated:Fire()
+    input.held=true; step(1); expect(clicks==1)
+    api=start(); step(1)
+    expect(api.Config.AutoFire and clicks==1 and api.Status.fireState=="Press right-click again")
+    input.InputBegan:Fire({UserInputType=Enum.UserInputType.MouseButton2},false)
+    step(1); expect(clicks==2)
+end)
+test("failing click API disables autofire while camera and ESP continue",function()
+    allowAutofire(); mouse1click=function() error("Input unavailable") end
+    local api=start(); ui("AutoFireToggle").Activated:Fire(); ui("ESPToggle").Activated:Fire()
+    input.held=true; step()
+    expect(not api.Config.AutoFire and api.Status.fireError:find("Input unavailable",1,true))
+    expect(api.Status.lastError==nil and api.Status.target=="Enemy" and api.Status.espCount==1)
+    local warned=#warnings; step(); expect(#warnings==warned)
+end)
+test("ESP shows enemies through walls and stays independent of aim radius",function()
+    local friend=newPlayer("Friend",5); friend.Team=team
+    local api=start(); api.Config.Radius=40
+    rayRule=function() return {Instance=wall} end
+    ui("ESPToggle").Activated:Fire(); step()
+    expect(api.Status.espCount==1 and api.Status.target==nil)
+    local folder=world:FindFirstChild("CentauraAssistHighlights")
+    local labels=me:FindFirstChild("PlayerGui"):FindFirstChild("CentauraAssistLabels")
+    expect(#folder.children==1 and #labels.children==1)
+    expect(folder.children[1].Adornee==enemy.Character)
+    expect(folder.children[1].DepthMode==Enum.HighlightDepthMode.AlwaysOnTop)
+    expect(labels.children[1].AlwaysOnTop==true)
+    local label=labels.children[1].children[1]
+    expect(label.Text:find("Enemy",1,true) and label.Text:find("100 HP",1,true))
+    enemy.Character:FindFirstChild("Humanoid").Health=37; step(0.21)
+    expect(label.Text:find("37 HP",1,true)~=nil)
+    ui("AssistToggle").Activated:Fire(); step(0.21)
+    expect(api.Status.espCount==1, "ESP can stay enabled while aim is paused")
+end)
+test("ESP handles respawn, team changes, departure, range and death",function()
+    local api=start(); ui("ESPToggle").Activated:Fire(); step()
+    local folder=world:FindFirstChild("CentauraAssistHighlights")
+    local old=folder.children[1]
+    enemy.Character=character("NewEnemy",5,0,100); enemy.CharacterAdded:Fire(enemy.Character)
+    step(0.21); expect(old.destroyed and folder.children[1].Adornee==enemy.Character)
+    enemy.Team=team; step(0.21); expect(api.Status.espCount==0 and #folder.children==0)
+    enemy.Team={}; step(0.21); expect(api.Status.espCount==1)
+    enemy.Character:FindFirstChild("Head").Position=Vector3.new(2100,0,100)
+    step(0.21); expect(api.Status.espCount==0)
+    enemy.Character:FindFirstChild("Head").Position=Vector3.new(5,0,100)
+    step(0.21); expect(api.Status.espCount==1)
+    enemy.Character:FindFirstChild("Humanoid").Health=0
+    step(0.21); expect(api.Status.espCount==0)
+    enemy.Character:FindFirstChild("Humanoid").Health=100
+    step(0.21); expect(api.Status.espCount==1)
+    enemy.Parent=nil; step(0.21); expect(api.Status.espCount==0)
+end)
+test("ESP clears when disabled, blurred or unloaded; rerun leaves one container",function()
+    local api=start(); ui("ESPToggle").Activated:Fire(); step(); expect(api.Status.espCount==1)
+    input.WindowFocusReleased:Fire(); step(); expect(api.Status.espCount==0)
+    input.WindowFocused:Fire(); step(); expect(api.Status.espCount==1)
+    ui("ESPToggle").Activated:Fire(); expect(api.Status.espCount==0)
+    ui("ESPToggle").Activated:Fire(); step(); expect(api.Status.espCount==1)
+    local old=world:FindFirstChild("CentauraAssistHighlights")
+    api=start(); step(); expect(old.destroyed and api.Config.ESP and api.Status.espCount==1)
+    local folders=0
+    for _, child in ipairs(world.children) do if child.Name=="CentauraAssistHighlights" then folders=folders+1 end end
+    expect(folders==1)
+    api.Destroy(); expect(world:FindFirstChild("CentauraAssistHighlights")==nil)
+    expect(me:FindFirstChild("PlayerGui"):FindFirstChild("CentauraAssistLabels")==nil)
+    expect(activeConnections()==0 and next(run.bindings)==nil)
+end)
+test("ESP rendering failure is isolated from camera assistance",function()
+    local original=Instance.new
+    Instance.new=function(class) if class=="Highlight" then error("Highlights unavailable") end; return original(class) end
+    local api=start(); ui("ESPToggle").Activated:Fire(); input.held=true; step()
+    Instance.new=original
+    expect(not api.Config.ESP and api.Status.espError)
+    expect(api.Status.target=="Enemy" and api.Status.lastError==nil)
+end)
+test("partial ESP creation failure removes already-created highlights",function()
+    local original=Instance.new
+    Instance.new=function(class) if class=="BillboardGui" then error("Labels unavailable") end; return original(class) end
+    local api=start(); ui("ESPToggle").Activated:Fire(); step()
+    Instance.new=original
+    expect(not api.Config.ESP and api.Status.espError)
+    expect(#world:FindFirstChild("CentauraAssistHighlights").children==0)
+    expect(#me:FindFirstChild("PlayerGui"):FindFirstChild("CentauraAssistLabels").children==0)
 end)
 print(string.format("PASS: %d scenarios, %d assertions",tests,assertions))

@@ -1,4 +1,4 @@
--- Centaura camera aim assist v2.0.0. Hold right-click to assist camera aim.
+-- Centaura camera aim assist v2.1.0. Optional aligned autofire and enemy ESP.
 -- Uses normal Roblox camera, input, GUI and raycast APIs; no gun-function hooks.
 if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -24,6 +24,10 @@ end
 
 local KEY = "centaura_camera_assist"
 local BINDING = "CentauraCameraAssistV2"
+local PANEL_HEIGHT = 818
+local FIRE_TOLERANCE = 8 -- Screen pixels from the camera crosshair.
+local ESP_DISTANCE = 2000 -- Studs.
+local clickFunction = type(mouse1click) == "function" and mouse1click or nil
 local previous = environment[KEY]
 local saved = type(previous) == "table" and previous.Config or {}
 if type(saved) ~= "table" then saved = {} end
@@ -37,6 +41,9 @@ local config = {
     ShowRadius = saved.ShowRadius ~= false,
     Radius = number(saved.Radius, 300, 40, 650),
     Strength = number(saved.Strength, 12, 3, 30),
+    AutoFire = saved.AutoFire == true and clickFunction ~= nil,
+    FireRate = number(saved.FireRate, 5, 2, 10),
+    ESP = saved.ESP == true,
 }
 if type(previous) == "table" and type(previous.Destroy) == "function" then
     previous.Destroy()
@@ -47,14 +54,32 @@ local gui, panel, reopen, ring, scale, statusLabel, statusDetail, statusDot
 local dragging, sliding
 local alive, focused = true, true
 local lockedPlayer
-local api = {Config = config, Status = {cameraUpdates = 0, target = nil, message = "Starting"}}
+local espEntries, toggleRenderers = {}, {}
+local espWorldFolder, espGuiFolder
+local clock, nextFireAt, firePending, espElapsed = 0, 0, false, 0.2
+local fireFocusReady = false
+local api = {Config = config, Status = {cameraUpdates = 0, fireAttempts = 0,
+    autoFireSupported = clickFunction ~= nil, espCount = 0, target = nil, message = "Starting"}}
 local status = api.Status
 local colors = {
     base = Color3.fromRGB(17, 21, 28), card = Color3.fromRGB(25, 30, 39),
     border = Color3.fromRGB(43, 51, 65), text = Color3.fromRGB(237, 242, 250),
     muted = Color3.fromRGB(146, 158, 179), accent = Color3.fromRGB(105, 219, 190),
     error = Color3.fromRGB(255, 159, 145),
+    enemy = Color3.fromRGB(246, 130, 130),
 }
+local function removeESP(other)
+    local entry = espEntries[other]
+    if entry then
+        if entry.highlight then entry.highlight:Destroy() end
+        if entry.billboard then entry.billboard:Destroy() end
+        espEntries[other] = nil
+    end
+end
+local function clearESP()
+    for other in pairs(espEntries) do removeESP(other) end
+    status.espCount = 0
+end
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
     table.insert(connections, connection)
@@ -67,6 +92,9 @@ local function destroy()
     for _, connection in ipairs(connections) do connection:Disconnect() end
     connections = {}
     lockedPlayer, dragging, sliding = nil, nil, nil
+    clearESP()
+    if espWorldFolder then espWorldFolder:Destroy() end
+    if espGuiFolder then espGuiFolder:Destroy() end
     status.target, status.message = nil, "Unloaded"
     if environment[KEY] == api then environment[KEY] = nil end
     if gui then gui:Destroy() end
@@ -94,10 +122,10 @@ local function fitPanel()
     local camera = workspace.CurrentCamera
     if not camera then return end
     local viewport = camera.ViewportSize
-    scale.Scale = math.clamp(math.min((viewport.X - 24) / 360, (viewport.Y - 24) / 578), 0.35, 1)
+    scale.Scale = math.clamp(math.min((viewport.X - 24) / 360, (viewport.Y - 24) / PANEL_HEIGHT), 0.35, 1)
     panel.Position = UDim2.fromOffset(
         math.clamp(panel.Position.X.Offset, 8, math.max(8, viewport.X - 360 * scale.Scale - 8)),
-        math.clamp(panel.Position.Y.Offset, 8, math.max(8, viewport.Y - 578 * scale.Scale - 8)))
+        math.clamp(panel.Position.Y.Offset, 8, math.max(8, viewport.Y - PANEL_HEIGHT * scale.Scale - 8)))
 end
 local function showPanel(visible)
     panel.Visible, reopen.Visible = visible, not visible
@@ -123,10 +151,21 @@ local function toggleRow(name, title, subtitle, y, key)
         knob.BackgroundColor3 = config[key] and colors.base or colors.text
         knob.Position = UDim2.fromOffset(config[key] and 19 or 3, 3)
     end
+    toggleRenderers[key] = render
     render()
     connect(row.Activated, function()
+        if key == "AutoFire" and not clickFunction then
+            status.fireError = "Xeno does not expose mouse1click"
+            warn("[Centaura] Autofire unavailable: " .. status.fireError)
+            return
+        end
         config[key] = not config[key]
         if key == "Enabled" then lockedPlayer = nil; status.lastError = nil end
+        if key == "AutoFire" then status.fireError = nil; fireFocusReady = true end
+        if key == "ESP" then
+            status.espError, espElapsed = nil, 0.2
+            if not config.ESP then clearESP() end
+        end
         render()
     end)
 end
@@ -176,7 +215,7 @@ local function createInterface()
     connect(gui.Destroying, destroy)
     gui.Parent = player:WaitForChild("PlayerGui")
     panel = make("Frame", {Name = "Panel", BackgroundColor3 = colors.base,
-        Position = UDim2.fromOffset(28, 80), Size = UDim2.fromOffset(360, 578), Active = true}, gui)
+        Position = UDim2.fromOffset(28, 80), Size = UDim2.fromOffset(360, PANEL_HEIGHT), Active = true}, gui)
     round(panel, 16)
     make("UIStroke", {Color = colors.border, Thickness = 1}, panel)
     scale = make("UIScale", {Scale = 1}, panel)
@@ -184,7 +223,7 @@ local function createInterface()
     local header = make("Frame", {Name = "DragHandle", BackgroundTransparency = 1, Active = true,
         Size = UDim2.fromOffset(290, 78)}, panel)
     text(header, "CENTAURA", 20, 14, 230, 26, 19, colors.text, true)
-    text(header, "Camera aim assist  /  v2.0", 20, 43, 250, 20, 12, colors.muted)
+    text(header, "Camera assist + ESP  /  v2.1", 20, 43, 250, 20, 12, colors.muted)
     local minimize = make("TextButton", {Name = "Minimize", Text = "-", TextSize = 24,
         Font = Enum.Font.Gotham, TextColor3 = colors.muted, BackgroundColor3 = colors.card,
         Position = UDim2.fromOffset(308, 22), Size = UDim2.fromOffset(32, 32)}, panel)
@@ -192,26 +231,29 @@ local function createInterface()
     connect(minimize.Activated, function() showPanel(false) end)
     toggleRow("AssistToggle", "Camera assist", "Hold right-click while a gun is equipped", 92, "Enabled")
     toggleRow("RadiusToggle", "Show radius", "Centered on the camera crosshair", 158, "ShowRadius")
-    sliderCard("Radius", "Targeting radius", "Only acquire targets inside this circle", 224, "Radius", 40, 650, " px")
-    sliderCard("Strength", "Aim strength", "Higher values turn the camera faster", 310, "Strength", 3, 30, " /s")
-    text(panel, "Team + wall checks", 22, 396, 210, 22, 12, colors.muted)
-    text(panel, "ALWAYS ON", 264, 396, 80, 22, 10, colors.accent, true)
+    toggleRow("AutoFireToggle", "Autofire", clickFunction and "Right-click held + crosshair aligned" or "Unavailable: mouse1click is missing", 224, "AutoFire")
+    toggleRow("ESPToggle", "Enemy ESP", "Outlines, names, distance and health", 290, "ESP")
+    sliderCard("Radius", "Targeting radius", "Only acquire targets inside this circle", 356, "Radius", 40, 650, " px")
+    sliderCard("Strength", "Aim strength", "Higher values turn the camera faster", 442, "Strength", 3, 30, " /s")
+    sliderCard("FireRate", "Autofire rate", "Click attempts; weapon fire rate still applies", 528, "FireRate", 2, 10, " /s")
+    text(panel, "Aim / fire: team + wall checks", 22, 614, 245, 22, 11, colors.muted)
+    text(panel, "ALWAYS ON", 264, 614, 80, 22, 10, colors.accent, true)
     local statusCard = make("Frame", {Name = "Status", BackgroundColor3 = colors.card,
-        Position = UDim2.fromOffset(20, 426), Size = UDim2.fromOffset(320, 66)}, panel)
+        Position = UDim2.fromOffset(20, 644), Size = UDim2.fromOffset(320, 88)}, panel)
     round(statusCard, 10)
     statusDot = make("Frame", {BackgroundColor3 = colors.muted, Size = UDim2.fromOffset(6, 6),
         Position = UDim2.fromOffset(14, 16)}, statusCard)
     round(statusDot, 3)
     statusLabel = text(statusCard, "Starting", 28, 6, 278, 24, 12, colors.text, true)
     statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    statusDetail = text(statusCard, "", 14, 31, 292, 28, 10, colors.muted)
+    statusDetail = text(statusCard, "", 14, 31, 292, 48, 10, colors.muted)
     statusDetail.TextWrapped = true
-    text(panel, "Drag header to move", 22, 502, 160, 22, 10, colors.muted)
-    local shortcut = text(panel, "RIGHT SHIFT: SHOW / HIDE", 172, 502, 166, 22, 9, colors.muted)
+    text(panel, "Drag header to move", 22, 742, 160, 22, 10, colors.muted)
+    local shortcut = text(panel, "RIGHT SHIFT: SHOW / HIDE", 172, 742, 166, 22, 9, colors.muted)
     shortcut.TextXAlignment = Enum.TextXAlignment.Right
     local unload = make("TextButton", {Name = "Unload", Text = "Unload assist", TextSize = 12,
         Font = Enum.Font.Gotham, TextColor3 = colors.muted, BackgroundColor3 = colors.card,
-        Position = UDim2.fromOffset(20, 532), Size = UDim2.fromOffset(320, 30)}, panel)
+        Position = UDim2.fromOffset(20, 772), Size = UDim2.fromOffset(320, 30)}, panel)
     round(unload, 9)
     connect(unload.Activated, destroy)
     reopen = make("TextButton", {Name = "Reopen", Text = "CENTAURA  +", Visible = false,
@@ -244,13 +286,66 @@ local function createInterface()
         if dragging and input == dragging.input then dragging = nil end
     end)
     connect(Input.InputBegan, function(input, processed)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then fireFocusReady = true end
         if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Enum.KeyCode.RightShift then
             showPanel(not panel.Visible)
         end
     end)
-    connect(Input.WindowFocusReleased, function() focused = false; lockedPlayer = nil; dragging = nil; sliding = nil end)
-    connect(Input.WindowFocused, function() focused = true end)
+    connect(Input.WindowFocusReleased, function() focused = false; fireFocusReady = false; lockedPlayer = nil; dragging = nil; sliding = nil end)
+    connect(Input.WindowFocused, function() focused = true; fireFocusReady = true end)
     connect(player.CharacterAdded, function() lockedPlayer = nil end)
+    espWorldFolder = make("Folder", {Name = "CentauraAssistHighlights"}, workspace)
+    espGuiFolder = make("Folder", {Name = "CentauraAssistLabels"}, player:WaitForChild("PlayerGui"))
+end
+
+local function updateESP(delta)
+    if not config.ESP or not focused or GuiService.MenuIsOpen or not workspace.CurrentCamera then
+        clearESP()
+        espElapsed = 0.2
+        return
+    end
+    espElapsed = espElapsed + delta
+    if espElapsed < 0.2 then return end
+    espElapsed = 0
+    local seen, count = {}, 0
+    local camera = workspace.CurrentCamera
+    for _, other in ipairs(Players:GetPlayers()) do
+        local character = other.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local anchor = character and (character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+        local eligible = other ~= player and other.Parent == Players and character and character.Parent
+            and (player.Team == nil or other.Team ~= player.Team) and humanoid and humanoid.Health > 0
+            and not character:FindFirstChildOfClass("ForceField") and anchor and anchor:IsA("BasePart")
+        local distance = eligible and (anchor.Position - camera.CFrame.Position).Magnitude or math.huge
+        if eligible and distance <= ESP_DISTANCE then
+            seen[other] = true
+            local entry = espEntries[other]
+            if entry and entry.character ~= character then removeESP(other); entry = nil end
+            if not entry then
+                entry = {character = character}
+                espEntries[other] = entry
+                -- Parent highlights in workspace and labels in PlayerGui; both use explicit adornees.
+                entry.highlight = make("Highlight", {Name = "EnemyOutline", Adornee = character,
+                    DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, FillTransparency = 0.9,
+                    OutlineTransparency = 0.1, Enabled = true}, espWorldFolder)
+                entry.billboard = make("BillboardGui", {Name = "EnemyLabel", Adornee = anchor,
+                    AlwaysOnTop = true, LightInfluence = 0, MaxDistance = ESP_DISTANCE,
+                    StudsOffsetWorldSpace = Vector3.new(0, 2.8, 0), Size = UDim2.fromOffset(180, 40)}, espGuiFolder)
+                entry.label = make("TextLabel", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+                    Font = Enum.Font.GothamBold, TextSize = 12, TextStrokeTransparency = 0.3,
+                    TextWrapped = false, RichText = false}, entry.billboard)
+            end
+            local color = status.target == other.Name and colors.accent or colors.enemy
+            entry.highlight.FillColor, entry.highlight.OutlineColor = color, color
+            entry.billboard.Adornee = anchor
+            entry.label.TextColor3 = color
+            entry.label.Text = string.format("%s\n%d studs | %d HP", other.DisplayName,
+                math.floor(distance + 0.5), math.floor(humanoid.Health + 0.5))
+            count = count + 1
+        end
+    end
+    for other in pairs(espEntries) do if not seen[other] then removeESP(other) end end
+    status.espCount = count
 end
 
 local rayParams = RaycastParams.new()
@@ -311,8 +406,53 @@ local function idle(message, detail)
     lockedPlayer, status.target = nil, nil
     status.message, status.detail = message, detail
 end
+local function fireFailure(problem)
+    config.AutoFire = false
+    status.fireError, status.fireState = tostring(problem), "Error"
+    toggleRenderers.AutoFire()
+    warn("[Centaura] Autofire disabled: " .. status.fireError)
+end
+local function maybeFire(camera, center, other, part, character, tool, barrel)
+    if not config.AutoFire or not clickFunction then return end
+    if not fireFocusReady then status.fireState = "Press right-click again"; return end
+    if firePending then status.fireState = "Pending"; return end
+    if Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then status.fireState = "Manual fire"; return end
+    local point, onScreen = camera:WorldToViewportPoint(part.Position)
+    if not onScreen or point.Z <= 0 or (Vector2.new(point.X, point.Y) - center).Magnitude > FIRE_TOLERANCE then
+        status.fireState = "Aligning"; return
+    end
+    if clock < nextFireAt then status.fireState = "Cooldown"; return end
+    firePending = true
+    nextFireAt = clock + 1 / config.FireRate
+    status.fireState = "Pending"
+    -- Some executors yield during a complete click; keep that off the render callback.
+    task.spawn(function()
+        local ok, problem = pcall(function()
+            -- Recheck when the task actually runs, including after a queued unload or target loss.
+            if not alive or not config.Enabled or not config.AutoFire or not focused or not fireFocusReady
+                or GuiService.MenuIsOpen or Input:GetFocusedTextBox() or dragging or sliding
+                or mouseOver(panel) or mouseOver(reopen) or workspace.CurrentCamera ~= camera
+                or player.Character ~= character or tool.Parent ~= character
+                or camera.CameraType == Enum.CameraType.Scriptable or status.target ~= other.Name
+                or not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+                or Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 then return end
+            if candidate(other, camera, center, barrel.Position, character) ~= part then return end
+            local current, visible = camera:WorldToViewportPoint(part.Position)
+            if not visible or current.Z <= 0 or (Vector2.new(current.X, current.Y) - center).Magnitude > FIRE_TOLERANCE then return end
+            status.fireAttempts = status.fireAttempts + 1
+            clickFunction()
+            if alive then status.fireState = "Click attempted" end
+        end)
+        firePending = false
+        if not ok and alive then fireFailure(problem) end
+    end)
+end
 local lastViewport
 local function update(delta)
+    clock = clock + math.max(delta, 0)
+    status.fireState = status.fireError and "Error" or (not clickFunction and "Unavailable" or (config.AutoFire and "Waiting" or "Off"))
     local camera = workspace.CurrentCamera
     if not camera then ring.Visible = false; idle("Waiting for camera", "Camera unavailable"); return end
     if camera.ViewportSize ~= lastViewport then lastViewport = camera.ViewportSize; fitPanel() end
@@ -355,6 +495,7 @@ local function update(delta)
     status.cameraUpdates = status.cameraUpdates + 1
     status.message = "Tracking: " .. targetPlayer.DisplayName
     status.detail = "Camera updates: " .. tostring(status.cameraUpdates) .. "  |  Release right-click to stop"
+    maybeFire(camera, center, targetPlayer, part, character, tool, barrel)
 end
 
 local startupOK, startupError = pcall(function()
@@ -370,10 +511,21 @@ local startupOK, startupError = pcall(function()
             ring.Visible = false
             if firstError then warn("[Centaura] Camera assist error: " .. status.lastError) end
         end
-        statusLabel.Text, statusDetail.Text = status.message, status.detail or ""
+        local espOK, espProblem = pcall(updateESP, delta)
+        if not espOK then
+            config.ESP = false
+            status.espError = tostring(espProblem)
+            clearESP()
+            toggleRenderers.ESP()
+            warn("[Centaura] ESP disabled: " .. status.espError)
+        end
+        local extras = status.fireError and ("Auto: " .. status.fireError)
+            or ("Auto: " .. tostring(status.fireState) .. " | ESP: " .. tostring(status.espCount))
+        if status.espError then extras = "ESP: " .. status.espError end
+        statusLabel.Text, statusDetail.Text = status.message, (status.detail or "") .. "\n" .. extras
         statusDot.BackgroundColor3 = status.lastError and colors.error or (status.target and colors.accent or colors.muted)
     end)
 end)
 if not startupOK then destroy(); error("[Centaura] Startup failed: " .. tostring(startupError)) end
-warn("[Centaura] Camera assist v2.0 loaded. Equip a gun and hold right-click. Right Shift shows/hides the panel.")
+warn("[Centaura] Camera assist v2.1 loaded. Autofire and enemy ESP have separate toggles. Right Shift shows/hides the panel.")
 return api
