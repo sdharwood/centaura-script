@@ -3,7 +3,7 @@
 `cold-war.luau` is a separate Cold War entrypoint adapted from the user-supplied Sneekys script. It does not change the Centaura entrypoint.
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/sdharwood/centaura-script/main/cold-war.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/sdharwood/centaura-script/cold-war-tools/cold-war.luau"))()
 ```
 
 ## Controls
